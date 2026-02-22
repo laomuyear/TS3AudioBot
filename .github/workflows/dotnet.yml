@@ -1,3 +1,4 @@
+
 name: Build TS3AudioBot
 
 on:
@@ -33,10 +34,9 @@ jobs:
     - name: Get Version
       id: get_version
       run: |
-        TSABVERSION=$(dotnet publish/TS3AudioBot.dll -V | grep -oP 'Version: \K.*')
+        # TSABVERSION=$(dotnet publish/TS3AudioBot.dll -V | grep -oP 'Version: \K.*')
         echo "Get Version: $TSABVERSION"
         echo "tsab_version=$TSABVERSION" >> "$GITHUB_OUTPUT"
-
   build_frontend:
     runs-on: ubuntu-latest
 
@@ -57,12 +57,10 @@ jobs:
       run: |
         cd WebInterface
         yarn install --frozen-lockfile
-
     - name: Build
       run: |
         cd WebInterface
         yarn run build
-
     - name: Archive
       uses: actions/upload-artifact@v4
       with:
@@ -96,7 +94,6 @@ jobs:
           --runtime ${{ matrix.rid }} \
           -p:PublishSingleFile=true,IncludeNativeLibrariesForSelfExtract=true \
           -o publish
-
     - name: Fetch WebInterface
       uses: actions/download-artifact@v4
       with:
@@ -119,30 +116,3 @@ jobs:
         echo "TSABVERSION=$TSABVERSION" >> $GITHUB_ENV
         echo "TSABBRANCH=$TSABBRANCH" >> $GITHUB_ENV
         echo "TASBBUILD=${TSABBRANCH}_${TASBBUILDSUFFIX}" >> $GITHUB_ENV
-
-    - name: Upload to Splamy.de
-      if: startsWith(matrix.rid, 'win-')
-      run: |
-        cd publish
-        zip -r ../TS3AudioBot.zip .
-        cd ..
-        curl \
-          -X PUT \
-          -H "Content-Type: application/zip" \
-          -H "Authorization: ${{ secrets.UPLOAD_TOKEN }}" \
-          --data-binary @TS3AudioBot.zip \
-          "https://splamy.de/api/nightly/projects/ts3ab/${TASBBUILD}?filename=TS3AudioBot.zip&commit=${{ github.sha }}&version=${TSABVERSION}"
-
-    - name: Upload to Splamy.de
-      if: startsWith(matrix.rid, 'linux-')
-      run: |
-        cd publish
-        chmod 755 TS3AudioBot
-        tar -czf ../TS3AudioBot.tar.gz .
-        cd ..
-        curl \
-          -X PUT \
-          -H "Content-Type: application/gzip" \
-          -H "Authorization: ${{ secrets.UPLOAD_TOKEN }}" \
-          --data-binary @TS3AudioBot.tar.gz \
-          "https://splamy.de/api/nightly/projects/ts3ab/${TASBBUILD}?filename=TS3AudioBot.tar.gz&commit=${{ github.sha }}&version=$TSABVERSION"
