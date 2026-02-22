@@ -48,6 +48,22 @@ public sealed class Player : IDisposable
 		config.Audio.Bitrate.Changed += (s, e) => EncoderPipe.Bitrate = ScaleBitrate(e.NewValue);
 
 		MergePipe.Into(TimePipe).Chain<CheckActivePipe>().Chain(StallCheckPipe).Chain(VolumePipe).Chain(EncoderPipe);
+
+		// 订阅 ffmpeg 重连事件
+		FfmpegProducer.ReconnectStarted += OnFfmpegReconnectStarted;
+		FfmpegProducer.ReconnectFinished += OnFfmpegReconnectFinished;
+	}
+
+	private void OnFfmpegReconnectStarted(object? sender, EventArgs e)
+	{
+		// 重连开始时暂停时钟，冻结进度条
+		scheduler.Invoke(() => TimePipe.Paused = true);
+	}
+
+	private void OnFfmpegReconnectFinished(object? sender, EventArgs e)
+	{
+		// 重连结束（无论成功或失败）恢复时钟
+		scheduler.Invoke(() => TimePipe.Paused = false);
 	}
 
 	public void SetTarget(IAudioPassiveConsumer target)
@@ -152,6 +168,10 @@ public sealed class Player : IDisposable
 
 	public void Dispose()
 	{
+		// 取消订阅 ffmpeg 事件
+		FfmpegProducer.ReconnectStarted -= OnFfmpegReconnectStarted;
+		FfmpegProducer.ReconnectFinished -= OnFfmpegReconnectFinished;
+
 		StopAll();
 		CleanSource(CurrentPlayerSource);
 		TimePipe.Dispose();

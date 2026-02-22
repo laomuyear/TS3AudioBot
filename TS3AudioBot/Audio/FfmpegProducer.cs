@@ -32,15 +32,24 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 	private const string PreLinkConf = "-hide_banner -nostats -threads 1 -i \"";
 	private const string PostLinkConf = "\" -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 	private const string LinkConfIcy = "-hide_banner -nostats -threads 1 -i pipe:0 -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
-	private static readonly TimeSpan retryOnDropBeforeEnd = TimeSpan.FromSeconds(10);
+	private static readonly TimeSpan retryOnDropBeforeEnd = TimeSpan.FromSeconds(3);
+	// 超时阈值
+	private static readonly TimeSpan dataTimeout = TimeSpan.FromSeconds(2);
+	// 最大重试次数
+	private const int MaxReconnectAttempts = 3;
 
 	private readonly ConfToolsFfmpeg config;
 
 	public event EventHandler? OnSongEnd;
 	public event EventHandler<SongInfoChanged>? OnSongUpdated;
+	// 重连事件
+	public event EventHandler? ReconnectStarted;
+	public event EventHandler? ReconnectFinished;
 
 	private readonly DedicatedTaskScheduler scheduler;
 	private FfmpegInstance? ffmpegInstance;
+	private CancellationTokenSource? monitorCts;
+	private Task? monitorTask;
 	public SampleInfo SampleInfo { get; } = SampleInfo.OpusMusic;
 
 	public FfmpegProducer(ConfToolsFfmpeg config, DedicatedTaskScheduler scheduler, Id id)
@@ -53,6 +62,7 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 	public Task AudioStart(string url, TimeSpan? startOff = null)
 	{
 		StartFfmpegProcess(url, startOff ?? TimeSpan.Zero);
+		StartMonitor();
 		return Task.CompletedTask;
 	}
 
@@ -62,11 +72,20 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 		{
 			Log.Warn("Failed to start icy stream: {0}", error);
 		}
+		StartMonitor();
 	}
 
 	public void AudioStop()
 	{
-		StopFfmpegProcess();
+		StopMonitor();
+		// 永久停止：关闭进程并清除实例
+		var instance = ffmpegInstance;
+		if (instance != null)
+		{
+			instance.OnMetaUpdated = null;
+			instance.Close();
+			ffmpegInstance = null;
+		}
 	}
 
 	public TimeSpan? Length => GetCurrentSongLength();
@@ -108,8 +127,30 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 			if (instance.FfmpegProcess.HasExitedSafe())
 			{
 				Log.Trace("Ffmpeg has exited");
-				AudioStop();
-				triggerEndSafe = true;
+				var expectedStopLength = GetCurrentSongLength();
+				var actualStopPosition = instance.AudioTimer.SongPosition;
+
+				// 判断是否正常结束（已播放至接近末尾）
+				bool isNaturalEnd = expectedStopLength != TimeSpan.Zero &&
+									actualStopPosition + retryOnDropBeforeEnd >= expectedStopLength;
+
+				if (isNaturalEnd)
+				{
+					// 正常结束，立即停止并触发结束事件
+					AudioStop();
+					triggerEndSafe = true;
+				}
+				else if (instance.ReconnectAttempts >= MaxReconnectAttempts)
+				{
+					// 已达最大重试次数，放弃重连
+					AudioStop();
+					triggerEndSafe = true;
+				}
+				else
+				{
+					// 异常退出但未达重试上限，等待监控线程重连
+					return 0;
+				}
 			}
 
 			if (triggerEndSafe)
@@ -117,6 +158,11 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 				OnSongEnd?.Invoke(this, EventArgs.Empty);
 				return 0;
 			}
+		}
+		else
+		{
+			// 更新最后数据时间
+			instance.LastDataTime = DateTime.UtcNow;
 		}
 
 		instance.HasTriedToReconnect = false;
@@ -126,6 +172,7 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 
 	private (bool ret, bool trigger) OnReadEmpty(FfmpegInstance instance)
 	{
+		// 进程已退出且未重连过
 		if (instance.FfmpegProcess.HasExitedSafe() && !instance.HasTriedToReconnect)
 		{
 			var expectedStopLength = GetCurrentSongLength();
@@ -137,16 +184,23 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 				if (actualStopPosition + retryOnDropBeforeEnd < expectedStopLength)
 				{
 					Log.Debug("Connection to song lost, retrying at {0}", actualStopPosition);
+
+					ReconnectStarted?.Invoke(this, EventArgs.Empty);
+
 					instance.HasTriedToReconnect = true;
 					if (SetPosition(actualStopPosition).Get(out var newInstance, out var error))
 					{
 						newInstance.HasTriedToReconnect = true;
+						ReconnectFinished?.Invoke(this, EventArgs.Empty);
 						return (true, false);
 					}
 					else
 					{
 						Log.Debug("Retry failed {0}", error);
-						return (false, true);
+						// 失败时不触发 ReconnectFinished，等待监控再次尝试
+						// 重置标志，让监控可以再次进入
+						instance.HasTriedToReconnect = false;
+						return (false, false);
 					}
 				}
 			}
@@ -171,7 +225,8 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 			else
 			{
 				Log.Debug("Retry failed {0}", newInstance.Error);
-				return (false, true);
+				instance.HasTriedToReconnect = false;
+				return (false, false);
 			}
 		}
 		return (false, false);
@@ -195,18 +250,19 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 	private R<FfmpegInstance, string> StartFfmpegProcess(string url, TimeSpan? offsetOpt)
 	{
 		StopFfmpegProcess();
-		Log.Trace("Start request {0}", url);
 
-		string arguments;
 		var offset = offsetOpt ?? TimeSpan.Zero;
+		string arguments;
+
 		if (offset > TimeSpan.Zero)
 		{
-			var seek = string.Format(CultureInfo.InvariantCulture, @"-ss {0:hh\:mm\:ss\.fff}", offset);
-			arguments = string.Concat(seek, " ", PreLinkConf, url, PostLinkConf, " ", seek);
+			var seek = string.Format(CultureInfo.InvariantCulture, @"{0:hh\:mm\:ss\.fff}", offset);
+			// 快速 seek：-ss 放在 -i 之前，加上 -seek_timestamp 1 确保精确
+			arguments = $"-hide_banner -nostats -threads 1 -ss {seek} -seek_timestamp 1 -i \"{url}\" -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 		}
 		else
 		{
-			arguments = string.Concat(PreLinkConf, url, PostLinkConf);
+			arguments = $"-hide_banner -nostats -threads 1 -i \"{url}\" -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 		}
 
 		var newInstance = new FfmpegInstance(
@@ -285,8 +341,9 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 
 			instance.AudioTimer.Start();
 
+			// 成功启动，替换为新实例，并关闭旧实例（旧实例可能已被关闭，但确保清理）
 			var oldInstance = Interlocked.Exchange(ref ffmpegInstance, instance);
-			oldInstance?.Close();
+			oldInstance?.Close(); // 关闭旧实例，但旧实例可能已经被关闭，这里再次关闭无害
 
 			return instance;
 		}
@@ -297,18 +354,19 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 				: $"Unable to create stream ({ex.Message})";
 			Log.Error(ex, error);
 			instance.Close();
-			StopFfmpegProcess();
+			// 启动失败，ffmpegInstance 仍指向旧实例（已关闭），不置 null
 			return error;
 		}
 	}
 
+	// 仅关闭进程，不移除引用，供重连时使用
 	private void StopFfmpegProcess()
 	{
-		var oldInstance = Interlocked.Exchange(ref ffmpegInstance, null);
-		if (oldInstance != null)
+		var instance = ffmpegInstance;
+		if (instance != null)
 		{
-			oldInstance.OnMetaUpdated = null;
-			oldInstance.Close();
+			instance.OnMetaUpdated = null;
+			instance.Close(); // 关闭进程，但不置 null
 		}
 	}
 
@@ -320,15 +378,99 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 			throw new Exception("Cannot read on own scheduler. Throwing to prevent deadlock");
 	}
 
+	// 启动监控线程
+	private void StartMonitor()
+	{
+		StopMonitor();
+		monitorCts = new CancellationTokenSource();
+		var token = monitorCts.Token;
+		monitorTask = Task.Run(async () =>
+		{
+			while (!token.IsCancellationRequested)
+			{
+				try
+				{
+					await Task.Delay(1000, token).ConfigureAwait(false); // 每1秒检查
+					var instance = ffmpegInstance;
+					if (instance == null) continue;
+
+					var timeSinceLastData = DateTime.UtcNow - instance.LastDataTime;
+					if (timeSinceLastData > dataTimeout && !instance.HasTriedToReconnect)
+					{
+						instance.HasTriedToReconnect = true;
+						instance.ReconnectAttempts++;
+						var actualStopPosition = instance.AudioTimer.SongPosition;
+
+						Log.Debug("Monitor: No data for {0} (attempt {1}/{2})", timeSinceLastData, instance.ReconnectAttempts, MaxReconnectAttempts);
+
+						scheduler.Invoke(() =>
+						{
+							ReconnectStarted?.Invoke(this, EventArgs.Empty);
+
+							// 杀死当前进程（但保留实例）
+							try { instance.Close(); } catch { }
+
+							if (instance.ReconnectAttempts <= MaxReconnectAttempts)
+							{
+								// 尝试重连，传入 actualStopPosition 保持进度
+								var result = SetPosition(actualStopPosition);
+								if (result.Get(out var newInstance, out var error))
+								{
+									// 成功，新实例已设置
+									newInstance.HasTriedToReconnect = true;
+									newInstance.ReconnectAttempts = instance.ReconnectAttempts;
+									Log.Debug("Reconnect successful (attempt {0})", instance.ReconnectAttempts);
+									ReconnectFinished?.Invoke(this, EventArgs.Empty); // 成功才恢复时钟
+								}
+								else
+								{
+									Log.Debug("Reconnect failed (attempt {0}): {1}", instance.ReconnectAttempts, error);
+									// 失败，重置标志以便下次监控再次尝试，且不恢复时钟
+									instance.HasTriedToReconnect = false;
+									// 注意：ReconnectAttempts 已经增加，下次会递增
+								}
+							}
+							else
+							{
+								Log.Error("Max reconnect attempts ({0}) reached, stopping song.", MaxReconnectAttempts);
+								// 已达最大次数，触发结束事件
+								OnSongEnd?.Invoke(this, EventArgs.Empty);
+								// 不恢复时钟，歌曲将结束
+							}
+						});
+					}
+				}
+				catch (OperationCanceledException)
+				{
+					break;
+				}
+				catch (Exception ex)
+				{
+					Log.Error(ex, "Monitor thread error");
+				}
+			}
+		}, token);
+	}
+
+	private void StopMonitor()
+	{
+		monitorCts?.Cancel();
+		monitorTask?.ContinueWith(t => Log.Debug(t.Exception, "Monitor stopped"), TaskContinuationOptions.OnlyOnFaulted);
+		monitorCts = null;
+		monitorTask = null;
+	}
+
 	public void Dispose()
 	{
-		StopFfmpegProcess();
+		StopMonitor();
+		AudioStop(); // 永久停止
 	}
 
 	private class FfmpegInstance
 	{
 		public Process FfmpegProcess { get; }
 		public bool HasTriedToReconnect { get; set; }
+		public int ReconnectAttempts { get; set; }  // 重试计数
 		public string ReconnectUrl { get; }
 		public bool IsIcyStream => IcyStream != null;
 
@@ -341,6 +483,9 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 
 		public Action<SongInfoChanged>? OnMetaUpdated;
 
+		// 最后数据时间
+		public DateTime LastDataTime { get; set; } = DateTime.UtcNow;
+
 		public FfmpegInstance(string url, PreciseAudioTimer timer) : this(url, timer, null!, 0) { }
 		public FfmpegInstance(string url, PreciseAudioTimer timer, Stream icyStream, int icyMetaInt)
 		{
@@ -351,6 +496,7 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 			IcyMetaInt = icyMetaInt;
 
 			HasTriedToReconnect = false;
+			ReconnectAttempts = 0;
 		}
 
 		public void Close()
@@ -388,11 +534,6 @@ public sealed class FfmpegProducer : IPlayerSource, IDisposable
 				int millisec = int.Parse(match.Groups[4].Value, CultureInfo.InvariantCulture) * 10;
 				ParsedSongLength = new TimeSpan(0, hours, minutes, seconds, millisec);
 			}
-
-			//if (!HasIcyTag && e.Data.AsSpan().TrimStart().StartsWith("icy-".AsSpan()))
-			//{
-			//	HasIcyTag = true;
-			//}
 		}
 
 		public void ReadStreamLoop(Id id)
